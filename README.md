@@ -19,11 +19,11 @@
     <img src="https://img.shields.io/badge/arXiv-Lift4D-d55c5c?logo=arxiv&style=flat" alt="arXiv">
   </a>
   &nbsp;
-  <a href="https://yehonathanlitman.github.io/lift_4d">
+  <a href="https://lift4d.github.io">
     <img src="https://img.shields.io/badge/Project-Page-6bbf59?logo=googlechrome&style=flat" alt="Project Page">
   </a>
   &nbsp;
-  <a href="https://yehonathanlitman.github.io/lift_4d/#reconstructions">
+  <a href="https://lift4d.github.io/#reconstructions">
     <img src="https://img.shields.io/badge/Interactive-4D-f2c14e?logo=unity&style=flat" alt="Interactive 4D">
   </a>
 </p>
