@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/TODO">
+  <a href="https://arxiv.org/abs/2606.23688">
     <img src="https://img.shields.io/badge/arXiv-Lift4D-d55c5c?logo=arxiv&style=flat" alt="arXiv">
   </a>
   &nbsp;
