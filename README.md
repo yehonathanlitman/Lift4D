@@ -42,7 +42,7 @@ If you find this work useful, please cite:
 @article{litman2026lift4d,
   author  = {Litman, Yehonathan and Ma, Xiaoxuan and Shah, Manan and Ugrinovic, Nicol\'{a}s and Kitani, Kris and De la Torre, Fernando and Tulsiani, Shubham},
   title   = {Lift4D: Harmonizing Single-View 3D Estimation for 4D Reconstruction In-the-Wild},
-  journal = {arXiv},
+  journal = {arXiv preprint arXiv:2606.23688},
   year    = {2026},
 }
 ```
