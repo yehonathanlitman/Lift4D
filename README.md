@@ -22,7 +22,7 @@
 </p>
 
 <h3 align="center">⚡️ TL;DR: Recover complete 4D asset reconstructions from videos in the wild.</h3>
-<img width="1207" height="782" alt="teaser" src="https://github.com/user-attachments/assets/3ca0d9f2-bd1e-4627-b653-ea382ecedbab" />
+<img width="1207" height="782" alt="teaser" src="https://github.com/user-attachments/assets/62c633c1-0fba-47bc-b78b-51a148a7eb69" />
 
 ## How it works
 
