@@ -1,0 +1,13 @@
+# Extra dependencies for Lift4D stage-3 training (train_lift4d_scgs.py), installed on
+# top of the shared `lift4d` environment. That environment already provides
+# torch (2.5.1+cu121), pytorch3d, opencv, scipy, imageio, Pillow, tqdm, etc., so we
+# only add what's missing here — pins kept minimal, to avoid downgrading the env.
+lpips
+piq
+plyfile<1.1                          # 1.1+ requires numpy>=2; stay on the env's numpy 1.26 (torch/cuda ABI)
+imageio-ffmpeg                       # FFMPEG backend for comparison/orbit videos
+clip @ git+https://github.com/openai/CLIP.git   # CLIP image encoder for Zero123 SDS guidance
+diffusers==0.29.2                    # DDIMScheduler for SDS (0.29.x imports cleanly with peft 0.10)
+transformers==4.39.3                 # CLIP/T5 text encoders imported by the Zero123 LDM
+kornia                               # image ops used by the Zero123 LDM
+taming-transformers-rom1504          # provides `taming` (VQ modules) for the Zero123 LDM

@@ -1,0 +1,47 @@
+# Core dependencies for the SAM3D video-inference pipeline (Lift4D stage 2).
+# Trimmed from the upstream requirements: removed training/serving/quantization/
+# dev tooling that the inference path never imports. torch/pytorch3d/gsplat/kaolin
+# live in the .[p3d]/.[inference] extras. Verified against static imports + the
+# checkpoint YAML _target_ strings.
+
+# --- model runtime ---
+hydra-core==1.3.2                 # instantiates the pipeline from checkpoints/*.yaml
+loguru==0.7.2
+lightning==2.3.3                  # checkpoint loading (sam3d_objects/model/io.py)
+xformers==0.0.28.post3
+spconv-cu121==2.3.8
+timm==0.9.16
+roma==1.5.1
+optree==0.14.1
+astor==0.8.1
+einops-exts==0.0.4
+ftfy==6.2.0                       # CLIP/tokenizer text cleaning
+fvcore==0.1.5.post20221221
+MoGe @ git+https://github.com/microsoft/MoGe.git@a8c37341bc0325ca99b9d57981cc3bb2bd3e255b
+
+# --- imaging / IO ---
+matplotlib
+opencv-python==4.9.0.80
+scikit-image==0.23.1
+OpenEXR==3.3.3
+imath==0.0.2
+av==12.0.0
+decord==0.6.0
+h5py==3.12.1
+
+# --- mesh decode path ---
+igraph==0.11.8
+open3d==0.18.0
+pymeshfix==0.17.0
+xatlas==0.0.9
+point-cloud-utils==0.29.5
+Rtree==1.3.0
+
+# --- build / cuda / misc utilities actually used ---
+cuda-python==12.1.0
+nvidia-cuda-nvcc-cu12==12.1.105
+nvidia-pyindex==1.0.9
+pip-system-certs==4.0
+easydict==1.13
+rootutils==1.0.7
+gdown==5.2.0                      # convenience: downloading datasets/weights
