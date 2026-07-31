@@ -1875,7 +1875,7 @@ class GUI:
         rc_render_metas = []
         rc_enabled = self.lambda_rc > 0
         if rc_enabled:
-            orbit_distance = getattr(self.args, 'rc_orbit_distance', None) or 5.0
+            orbit_distance = getattr(self.args, 'rc_orbit_distance', None) or 3.0
             render_size = 512
             rc_batch_size = getattr(self.args, 'rc_batch_size', 2)
 
@@ -2841,7 +2841,7 @@ if __name__ == "__main__":
                         help="Batch size for KNN precomputation to avoid OOM on large point clouds (default: 4096)")
     parser.add_argument("--lambda_rc", type=float, default=0,
                         help="Random-camera (novel view) anchoring loss weight — applies to both the depth and RGB terms (default: 0)")
-    parser.add_argument("--rc_orbit_distance", type=float, default=5.0,
+    parser.add_argument("--rc_orbit_distance", type=float, default=3.0,
                         help="Random camera orbit distance from object centroid (default: auto per dataset)")
     parser.add_argument("--rc_batch_size", type=int, default=2,
                         help="Number of random cameras to sample per iteration for RC loss (default: 1)")
@@ -2951,7 +2951,7 @@ if __name__ == "__main__":
             # Set per-object DAVIS defaults if not explicitly provided
             if args.dataset == "davis":
                 if user_rc_orbit_distance is None:
-                    args.rc_orbit_distance = DAVIS_RC_ORBIT_DEFAULTS.get(obj_name, 5.0)
+                    args.rc_orbit_distance = DAVIS_RC_ORBIT_DEFAULTS.get(obj_name, 3.0)
                     print(f"  RC orbit distance (auto): {args.rc_orbit_distance}")
                 if user_max_frames <= 0 and obj_name in DAVIS_MAX_FRAMES_DEFAULTS:
                     args.max_frames = DAVIS_MAX_FRAMES_DEFAULTS[obj_name]
