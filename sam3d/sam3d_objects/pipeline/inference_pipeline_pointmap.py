@@ -239,7 +239,18 @@ class InferencePipelinePointMap(InferencePipeline):
 
 
 
-    def compute_pointmap(self, image, pointmap=None):
+    def compute_pointmap(self, image, pointmap=None, intrinsics=None):
+        """Build the camera-space pointmap for one frame.
+
+        Args:
+            pointmap: optional external (H, W, 3) pointmap (e.g. DA3) to use
+                instead of running the depth model.
+            intrinsics: optional normalized 3x3 intrinsics belonging to that
+                external pointmap. Supply them whenever they are known: the
+                fallback infers intrinsics from the pointmap itself, which
+                yields NEGATIVE focals for pointmaps already in the PyTorch3D
+                convention (x/y flipped).
+        """
         loaded_image = self.image_to_float(image)
         loaded_image = torch.from_numpy(loaded_image)
         loaded_mask = loaded_image[..., -1]
@@ -268,7 +279,6 @@ class InferencePipelinePointMap(InferencePipeline):
                     size=(loaded_image.shape[1], loaded_image.shape[2]),
                     mode="nearest",
                 ).squeeze(0).permute(1, 2, 0)
-            intrinsics = None
 
         points_tensor = points_tensor.permute(2, 0, 1)
         points_tensor = self._clip_pointmap(points_tensor, loaded_mask)

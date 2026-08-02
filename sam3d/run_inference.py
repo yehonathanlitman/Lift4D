@@ -27,10 +27,11 @@ from typing import List, Optional
 from loguru import logger
 import numpy as np
 
-# Import inference code
-sys.path.append("notebook")
+_SAM3D_DIR = str(Path(__file__).resolve().parent)
+sys.path.append(os.path.join(_SAM3D_DIR, "notebook"))
 from inference import Inference
 from sam3d_objects.pipeline.video_utils import load_video_frames_and_masks
+from da3_utils import run_da3_inference
 
 # Shared dataset registry (lives at repo root, one level above sam3d/).
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -85,13 +86,7 @@ def render_gs_frame(gs_result, transform, focal_length, width, height,
 
     # Apply object → camera transform
     if transform is not None:
-        raw_scale = transform["scale"].to(device)
-        scale_val = raw_scale.flatten()[0].item()
-        # Clamp scale >= 1.0 to unit scale (artifact workaround).
-        if scale_val >= 1.0:
-            scale_t = torch.ones_like(raw_scale)
-        else:
-            scale_t = raw_scale
+        scale_t = transform["scale"].to(device)
         trans_t = transform["translation"].to(device)
         rot_t = transform["rotation"].to(device)
 
@@ -146,6 +141,122 @@ def render_gs_frame(gs_result, transform, focal_length, width, height,
         rendered = rendered[:height, crop:crop + width]
 
     return rendered.cpu().numpy().clip(0, 255).astype(np.uint8)
+
+
+def _mask_to_square_canvas(mask, width, height, size, device):
+    """GT mask -> float target on the square render canvas, at `size` px."""
+    import torch
+    m = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device)
+    if m.ndim == 3:
+        m = m[..., 0]
+    m = (m > (127.0 if float(m.max()) > 1.5 else 0.5)).float()
+    max_dim = max(width, height)
+    canvas = torch.zeros((max_dim, max_dim), dtype=torch.float32, device=device)
+    if width > height:
+        top = (max_dim - height) // 2
+        canvas[top:top + height, :width] = m
+    else:
+        left = (max_dim - width) // 2
+        canvas[:height, left:left + width] = m
+    return torch.nn.functional.interpolate(
+        canvas[None, None], size=(size, size), mode="area")[0, 0]
+
+
+def refine_pose_to_mask(gs, transform, mask, focal_length, width, height,
+                        device="cuda", schedule=((256, 80), (512, 60))):
+    """Refine one frame's object pose so its silhouette matches the input mask.
+
+    SAM3D predicts each frame's pose from a scale/shift-invariant pointmap. The
+    raw prediction places the object at the right depth but oversized, so the
+    reconstruction does not reproject onto the video object. The released
+    pipeline handles this for single images with `layout_post_optimization`
+    (ICP + silhouette render-compare, enabled by default in `run()`), but that
+    path is unavailable here: pipeline.yaml wires no
+    `layout_post_optimization_method`, and its open3d ICP is not usable on all
+    platforms.
+
+    This is the equivalent step done with gsplat: optimize scale/translation
+    (then also rotation) to maximize a soft IoU between the rendered silhouette
+    and the mask, coarse-to-fine, under the SAME intrinsics the pipeline uses
+    downstream. It consumes only pipeline inputs (the frame's own object mask).
+
+    Returns (transform dict with the same keys/shapes, final hard IoU).
+    """
+    import torch
+    from gsplat import rasterization
+    from pytorch3d.transforms import (quaternion_multiply, quaternion_invert,
+                                      quaternion_to_matrix)
+    from sam3d_objects.data.dataset.tdfy.transforms_3d import compose_transform
+
+    xyz = gs.get_xyz.to(device).float().detach()
+    quats0 = gs.get_rotation.to(device).float().detach()
+    scaling0 = gs.get_scaling.to(device).float().detach()
+    opacity = gs.get_opacity.to(device).float().detach().squeeze(-1)
+    colors = torch.ones((xyz.shape[0], 3), dtype=torch.float32, device=device)
+
+    scale0 = transform["scale"].to(device).float().detach()
+    trans0 = transform["translation"].to(device).float().detach()
+    quat0 = transform["rotation"].to(device).float().detach()
+
+    max_dim = max(width, height)
+    viewmat = torch.eye(4, dtype=torch.float32, device=device).unsqueeze(0)
+
+    log_s = torch.zeros(1, device=device, requires_grad=True)
+    dt = torch.zeros(3, device=device, requires_grad=True)
+    dq = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device, requires_grad=True)
+
+    def current():
+        scale_t = scale0 * torch.exp(log_s)
+        quat_t = quaternion_multiply(dq / dq.norm(), quat0)
+        return scale_t, quat_t, trans0 + dt
+
+    def render_alpha(size):
+        scale_t, quat_t, trans_t = current()
+        tfm = compose_transform(scale=scale_t, rotation=quaternion_to_matrix(quat_t),
+                                translation=trans_t)
+        pts = tfm.transform_points(xyz.unsqueeze(0))[0] @ _get_r_p3d_to_cam(device).T
+        g_quats = quaternion_multiply(
+            quaternion_invert(quat_t.squeeze().unsqueeze(0).expand(quats0.shape[0], -1)),
+            quats0)
+        g_scales = scaling0 * scale_t.squeeze()
+        f = focal_length * size / max_dim
+        Ks = torch.tensor([[f, 0, size / 2.0], [0, f, size / 2.0], [0, 0, 1]],
+                          dtype=torch.float32, device=device).unsqueeze(0)
+        _, alphas, _ = rasterization(
+            means=pts.float(), quats=g_quats.float(), scales=g_scales.float(),
+            opacities=opacity, colors=colors, sh_degree=None, viewmats=viewmat,
+            Ks=Ks, width=size, height=size)
+        return alphas.squeeze(0).squeeze(-1)
+
+    def soft_iou_loss(a, target):
+        inter = (a * target).sum()
+        return 1.0 - inter / (a.sum() + target.sum() - inter + 1e-6)
+
+    for size, iters in schedule:
+        target = _mask_to_square_canvas(mask, width, height, size, device)
+        # stage 1 places the object (translation+scale), stage 2 adds rotation
+        for params, lr, n in ((( dt, log_s), 1e-2, iters),
+                              ((dq, dt, log_s), 4e-3, iters)):
+            opt = torch.optim.Adam(list(params), lr=lr)
+            prev = None
+            for _ in range(n):
+                opt.zero_grad()
+                loss = soft_iou_loss(render_alpha(size), target)
+                loss.backward()
+                opt.step()
+                if prev is not None and abs(loss.item() - prev) < 1e-7:
+                    break
+                prev = loss.item()
+
+    with torch.no_grad():
+        size = schedule[-1][0]
+        target = _mask_to_square_canvas(mask, width, height, size, device)
+        a = render_alpha(size) > 0.5
+        g = target > 0.5
+        final_iou = float((a & g).sum()) / max(float((a | g).sum()), 1.0)
+        scale_t, quat_t, trans_t = current()
+    return ({"scale": scale_t.detach(), "translation": trans_t.detach(),
+             "rotation": quat_t.detach()}, final_iou)
 
 
 def load_gaussian_from_ply(ply_path, device="cuda"):
@@ -286,6 +397,9 @@ def run_video_inference_cli(
     output_name: Optional[str] = None,
     render_video: bool = False,
     output_dir: str = "visualization",
+    run_da3: bool = False,
+    da3_npz_path: Optional[str] = None,
+    refine_pose: bool = False,
 ):
     """
     Run video inference - generates one mesh per frame
@@ -301,18 +415,14 @@ def run_video_inference_cli(
         output_name: Optional subdirectory name under output_dir for results.
         render_video: If True, render a side-by-side comparison video after
                       inference.
+        run_da3: If True (and no da3_npz_path), run Depth Anything 3 over the
+                 selected frames first, saving <output>/da3/da3_output.npz.
+        da3_npz_path: Existing DA3 npz whose pointmaps align each frame's pose
+                 estimate (frame order must match the processed frames).
     """
-    config_path = f"checkpoints/{model_tag}/pipeline.yaml"
+    config_path = os.path.join(_SAM3D_DIR, "checkpoints", model_tag, "pipeline.yaml")
     if not Path(config_path).exists():
         raise FileNotFoundError(f"Model config file not found: {config_path}")
-
-    logger.info(f"Loading model: {config_path}")
-    inference = Inference(config_path, compile=False)
-
-    if hasattr(inference._pipeline, 'rendering_engine'):
-        if inference._pipeline.rendering_engine != "pytorch3d":
-            logger.warning(f"Rendering engine is set to {inference._pipeline.rendering_engine}, changing to pytorch3d")
-            inference._pipeline.rendering_engine = "pytorch3d"
 
     # Load video frames and masks
     logger.info(f"Loading video frames from: {input_path}")
@@ -339,6 +449,56 @@ def run_video_inference_cli(
         output_base = visualization_dir / f"{input_path.name}_video_streaming"
     output_base.mkdir(parents=True, exist_ok=True)
 
+    if da3_npz_path is None and run_da3:
+        da3_dir = output_base / "da3"
+        selected_paths = _resolve_frame_paths(input_path, image_names)
+        if selected_paths is not None:
+            run_da3_inference(image_files=selected_paths, output_dir=str(da3_dir))
+        else:
+            # No explicit frame list: DA3's numeric-sorted dir glob matches the
+            # frame loader's ordering; cap at the number of frames loaded.
+            run_da3_inference(image_dir=str(input_path), output_dir=str(da3_dir),
+                              max_frames=num_frames)
+        da3_npz_path = str(da3_dir / "da3_output.npz")
+
+    da3_pointmaps = None
+    da3_intrinsics = None
+    da3_focals = None
+    if da3_npz_path and Path(da3_npz_path).exists():
+        import torch
+        da3_data = np.load(da3_npz_path, allow_pickle=True)
+        da3_pm = da3_data["pointmaps"]  # (N, H, W, 3)
+        if da3_pm.shape[0] != num_frames:
+            logger.warning(
+                f"DA3 npz has {da3_pm.shape[0]} frames but {num_frames} are being "
+                f"processed; skipping DA3 pose alignment")
+        else:
+            da3_pointmaps = [
+                torch.tensor(da3_pm[i], dtype=torch.float32)
+                for i in range(da3_pm.shape[0])
+            ]
+            # Pixel-unit fy at the original frame resolution, one per frame.
+            da3_focals = [float(K[1, 1]) for K in da3_data["intrinsics"]]
+            # The pipeline works in NORMALIZED intrinsics (fx/W, fy/H, cx/W,
+            # cy/H). Pass DA3's own — inferring them from the pointmap gives a
+            # negative focal, since the pointmap is already axis-flipped.
+            da3_intrinsics = []
+            for i, K in enumerate(da3_data["intrinsics"]):
+                fh, fw = da3_pm[i].shape[0], da3_pm[i].shape[1]
+                Kn = np.array(K, dtype=np.float32).copy()
+                Kn[0, 0] /= fw; Kn[0, 2] /= fw
+                Kn[1, 1] /= fh; Kn[1, 2] /= fh
+                da3_intrinsics.append(torch.tensor(Kn, dtype=torch.float32))
+            logger.info(f"Loaded {len(da3_pointmaps)} DA3 pointmaps for pose alignment")
+
+    logger.info(f"Loading model: {config_path}")
+    inference = Inference(config_path, compile=False)
+
+    if hasattr(inference._pipeline, 'rendering_engine'):
+        if inference._pipeline.rendering_engine != "pytorch3d":
+            logger.warning(f"Rendering engine is set to {inference._pipeline.rendering_engine}, changing to pytorch3d")
+            inference._pipeline.rendering_engine = "pytorch3d"
+
     results = inference._pipeline.run_video_inference(
         frame_images=frame_images,
         frame_masks=frame_masks,
@@ -351,12 +511,56 @@ def run_video_inference_cli(
         use_vertex_color=vertex_color,
         initial_frame_index=initial_frame_index,
         consistency_strength=consistency_strength,
+        pointmaps=da3_pointmaps,
+        pointmap_intrinsics=da3_intrinsics,
     )
 
     print(f"\n{'='*60}")
     print(f"Video inference completed!")
     print(f"Processed {num_frames} frames")
     print(f"{'='*60}")
+
+    def frame_focal(result):
+        fi = result["frame_idx"]
+        gt_h, gt_w = frame_images[fi].shape[:2]
+        if da3_focals is not None:
+            return da3_focals[fi]
+        # No DA3: use the depth model's own normalized intrinsics
+        # (f_px = fy_norm * H); fall back to a resolution-relative guess.
+        intr = result.get("intrinsics", None)
+        if intr is not None:
+            f_px = float(np.asarray(intr.detach().cpu()).reshape(3, 3)[1, 1] * gt_h)
+            if f_px > 0:
+                return f_px
+        return max(gt_h, gt_w) * 1.2
+
+    # Silhouette pose refinement (see refine_pose_to_mask): the raw predicted
+    # pose is systematically oversized, so without this the reconstruction does
+    # not reproject onto the video object.
+    refined = {}
+    if refine_pose:
+        ious = []
+        for result in results:
+            fi = result["frame_idx"]
+            gs = result.get("gs") or (result.get("gaussian") or [None])[0]
+            if gs is None or frame_masks[fi] is None:
+                continue
+            gt_h, gt_w = frame_images[fi].shape[:2]
+            focal = frame_focal(result)
+            try:
+                tf = {k: result[k] for k in ("scale", "translation", "rotation")}
+                new_tf, iou = refine_pose_to_mask(
+                    gs, tf, frame_masks[fi], focal, gt_w, gt_h)
+                refined[fi] = new_tf
+                ious.append(iou)
+            except Exception as e:
+                logger.warning(f"Frame {fi}: pose refinement failed ({e}); keeping raw pose")
+            if len(ious) % 20 == 0 and ious:
+                logger.info(f"  refined {len(ious)}/{num_frames} frames "
+                            f"(running mean IoU {np.mean(ious):.4f})")
+        if ious:
+            logger.info(f"Pose refinement: mean silhouette IoU {np.mean(ious):.4f} "
+                        f"over {len(ious)} frames")
 
     # Save outputs for each frame
     for result in results:
@@ -386,21 +590,13 @@ def run_video_inference_cli(
                 saved_files.append("result.ply")
 
         # Save object transforms JSON for this frame
+        src = refined.get(frame_idx, result)
         obj_transforms = {}
         for key in ('scale', 'translation', 'rotation'):
-            if key in result:
-                obj_transforms[key] = result[key].cpu().numpy().tolist()
+            if key in src:
+                obj_transforms[key] = src[key].cpu().numpy().tolist()
 
-        # Persist SAM3D's own camera focal estimate (pixels, at this frame's
-        # resolution). intrinsics are normalized (fx,fy relative to W,H with
-        # principal point 0.5), so f_px = fy_norm * H == fx_norm * W. lift4d
-        # renders in a max(H,W) square, and this focal is the pixel-per-angle
-        # scale the SAM3D pose was optimized against.
-        intr = result.get("intrinsics", None)
-        if intr is not None:
-            K = intr.detach().cpu().numpy().reshape(3, 3)
-            gt_h, gt_w = frame_images[frame_idx].shape[:2]
-            obj_transforms["focal"] = float(K[1, 1] * gt_h)
+        obj_transforms["focal"] = frame_focal(result)
 
         if obj_transforms:
             transform_path = frame_dir / "obj_transform.json"
@@ -417,6 +613,22 @@ def run_video_inference_cli(
     print(f"\n{'='*60}")
     print(f"All output files saved to: {output_base}")
     print(f"{'='*60}")
+
+
+def _resolve_frame_paths(frames_dir: Path, image_names: Optional[List[str]]) -> Optional[List[str]]:
+    """Resolve ordered frame stems to image paths (for DA3). None if no stems."""
+    if image_names is None:
+        return None
+    paths = []
+    for stem in image_names:
+        for ext in ('.png', '.jpg', '.jpeg', '.webp', '.bmp'):
+            p = Path(frames_dir) / f"{stem}{ext}"
+            if p.exists():
+                paths.append(str(p))
+                break
+        else:
+            raise FileNotFoundError(f"No image file for frame stem '{stem}' in {frames_dir}")
+    return paths
 
 
 def _discover_stems(frames_dir: Path) -> List[str]:
@@ -562,6 +774,33 @@ Examples:
              "If all frame PLYs already exist, skips inference and only renders."
     )
 
+    parser.add_argument(
+        "--run_da3",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run Depth Anything 3 over the selected frames before SAM3D and "
+             "save <output>/da3/da3_output.npz (cached across runs). The DA3 "
+             "pointmaps align each frame's pose estimate, and the npz gives "
+             "stage 3 its camera focal and per-frame scene depths for "
+             "--occlusion_compositing. Use --no-run_da3 to disable."
+    )
+    parser.add_argument(
+        "--da3_npz",
+        type=str,
+        default=None,
+        help="Use an existing da3_output.npz instead of running DA3 (frame "
+             "order must match the processed frames)."
+    )
+    parser.add_argument(
+        "--refine_pose",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Refine each frame's pose so the reconstruction reprojects onto "
+             "its own input mask (silhouette render-compare; the equivalent of "
+             "SAM3D's layout post-optimization). Off by default; enable it when "
+             "the predicted pose is oversized and the render does not line up "
+             "with the video."
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -722,7 +961,15 @@ Examples:
             frame_dirs = sorted(
                 d for d in output_base.iterdir()
                 if d.is_dir() and (d / "result.ply").exists()
+                and (d / "obj_transform.json").exists()
             )
+            expected = len(image_names) if image_names is not None else len(frame_dirs)
+            if frame_dirs and len(frame_dirs) < expected:
+                logger.warning(
+                    f"Found only {len(frame_dirs)}/{expected} complete frames in "
+                    f"{output_base}; re-running inference for the full sequence"
+                )
+                frame_dirs = []
             if frame_dirs:
                 logger.info(
                     f"Found {len(frame_dirs)} existing frame PLYs in "
@@ -761,6 +1008,9 @@ Examples:
         output_name=output_name,
         render_video=args.render_video,
         output_dir=output_dir,
+        run_da3=args.run_da3,
+        da3_npz_path=args.da3_npz,
+        refine_pose=args.refine_pose,
     )
 
 

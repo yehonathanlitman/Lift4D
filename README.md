@@ -90,6 +90,7 @@ hf download --repo-type model stabilityai/stable-zero123 stable_zero123.ckpt \
 Put datasets under `data/` or set `LIFT4D_DATA_ROOT` to point elsewhere. Layout:
 
 ```
+mkdir -p data/custom
 data/
 ├── DAVIS/JPEGImages/480p/<object>/00000.jpg ...  # RGB frames
 │   └── Annotations/480p/<object>/00000.png ...   # binary masks
@@ -158,13 +159,20 @@ python run_inference.py --dataset davis --video_consistency 0.2 --object_name rh
 python run_inference.py --dataset consistent4d --video_consistency 0.1 --object_name scaring_skull --render_video
 # custom (mask_name = <prompt>_<instance> from stage 1, e.g. goat_1)
 python run_inference.py --dataset custom --object_name goat --mask_name goat_1 \
-     --video_consistency 0.2 --render_video #--subsampling 4 --num_frames 40
+     --video_consistency 0.2 --render_video --num_frames 64 #--subsampling 4
 ```
 
 Knobs: `--subsampling N` (keep every Nth frame), `--num_frames N` (total frames to
 reconstruct after subsampling; default `100`, use `0` for all), `--video_consistency` in
 `[0,1]` (higher = preserve more structure, for example for rigid objects), `--render_video` (writes a
 side-by-side `comparison.mp4`).
+
+By default stage 2 also runs [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3)
+over the selected frames (`--run_da3`, disable with `--no-run_da3`).
+
+If pose alignment with the object in the video is bad in `comparison.mp4`, try using pose refinement with
+`--refine_pose`. It optimizes each frame's pose so its rendered silhouette
+matches that frame's input mask. Off by default.
 
 ### Stage 3 — Lift4D training
 
@@ -214,8 +222,12 @@ python train_lift4d_scgs.py $DS \
     --lambda_sds_rgb 0.1 --enable_lpips \
     --optimize_per_frame_compose_transforms_app --compose_lr_reset \
     --position_lr_init_app 1.6e-4 \
-    --position_lr_max_steps 30000 --deform_lr_max_steps 26000 --smooth_transforms_window 5 #--occlusion_compositing #inpaint occlusions
+    --position_lr_max_steps 30000 --deform_lr_max_steps 26000 --smooth_transforms_window 5 --occlusion_compositing #inpaint occlusions
 ```
+
+`--occlusion_compositing` needs
+the per-frame DA3 scene depths from `sam3d_output/<tag>/da3/da3_output.npz` — present
+automatically when stage 2 ran with its default `--run_da3` (or point `--da3_npz` at one).
 
 **Efficiency:** step A needs ~10k iters (<50 frames) or ~20k (>50 frames). Step B reaches
 max quality by ~10k iters (diminishing returns beyond). For faster runs, use these flags:
@@ -233,7 +245,8 @@ max quality by ~10k iters (diminishing returns beyond). For faster runs, use the
   - ~6k iterations provide most of the appearance gain.
 - `--ddim_steps 3`
   - Reduce DDIM steps for faster SDS.
-
+- `--knn_batch_size 512`
+  - Reduce KNN batch size for lower VRAM usage.
 ### Outputs
 
 Trained assets land in `lift4d_scgs/output/<tag>_<deform_type>/` and comprise of the deformable Gaussian

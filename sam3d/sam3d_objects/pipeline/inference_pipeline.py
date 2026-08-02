@@ -886,6 +886,8 @@ class InferencePipeline:
         use_vertex_color: bool = False,
         initial_frame_index: int = 0,
         consistency_strength: float = 0.3,
+        pointmaps: Optional[List] = None,
+        pointmap_intrinsics: Optional[List] = None,
     ) -> List[dict]:
         """
         Run video inference on a sequence of frames.
@@ -909,6 +911,15 @@ class InferencePipeline:
             consistency_strength: Strength of temporal consistency [0.0, 1.0].
                 Higher preserves more structure from the neighbor frame,
                 lower allows more deformation.
+            pointmaps: Optional list of external (e.g. DA3) pointmaps, one per
+                frame, each an (H, W, 3) torch.Tensor in the pipeline camera
+                convention. When given, frame poses are estimated against these
+                instead of the depth model's per-frame geometry, and the
+                exported intrinsics follow them.
+            pointmap_intrinsics: Optional list of normalized 3x3 intrinsics
+                matching `pointmaps` (fx/W, fy/H, cx/W, cy/H). Pass these with
+                external pointmaps so the true camera is used instead of one
+                inferred from the (axis-flipped) pointmap.
 
         Returns:
             List of result dicts, one per frame.
@@ -948,10 +959,16 @@ class InferencePipeline:
 
             # Preprocessing (with self.device sets default device for tensor
             # creation, matching how run() calls compute_pointmap)
+            frame_pointmap = pointmaps[frame_idx] if pointmaps is not None else None
+            frame_pm_intrinsics = (
+                pointmap_intrinsics[frame_idx] if pointmap_intrinsics is not None else None
+            )
             frame_intrinsics = None
             if hasattr(self, 'compute_pointmap'):
                 with self.device:
-                    pointmap_dict = self.compute_pointmap(rgba_image)
+                    pointmap_dict = self.compute_pointmap(
+                        rgba_image, pointmap=frame_pointmap,
+                        intrinsics=frame_pm_intrinsics)
                 pointmap = pointmap_dict["pointmap"]
                 frame_intrinsics = pointmap_dict.get("intrinsics", None)
                 ss_input_dict = self.preprocess_image(rgba_image, self.ss_preprocessor, pointmap=pointmap)

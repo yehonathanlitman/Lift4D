@@ -196,10 +196,6 @@ class SAM3DDataLoader:
         print(f"SAM3DDataLoader: Found {self.num_frames} valid frames for selector '{selector}'")
 
         # --- Camera focal length (pixels, for the max(H,W) square render) ---
-        # Priority: (1) SAM3D's own per-frame focal estimate saved in
-        # obj_transform.json ("focal"); (2) an explicit DA3 npz; (3) a
-        # resolution-based fallback. SAM3D's estimate is the pixel-per-angle
-        # scale its pose was optimized against, so it is the correct default.
         self.da3_depths = {}
         self._da3_process_res = None
         self.focal_length = None
@@ -218,7 +214,6 @@ class SAM3DDataLoader:
             self.focal_length = float(np.median(sam3d_focals))
             print(f"  Focal length (SAM3D estimate, median of {len(sam3d_focals)}): {self.focal_length:.2f}")
 
-        # (2) Explicit DA3 npz overrides (pixel intrinsics at DA3 resolution).
         da3_npz_path = self._generic_da3_npz if self._generic_da3_npz is not None else \
             os.path.join(self.vis_dir.rstrip('/').removesuffix('_video_streaming'), "da3", "da3_output.npz")
         if os.path.exists(da3_npz_path):
@@ -227,10 +222,26 @@ class SAM3DDataLoader:
             if 'depth' in camera_data:
                 depth_data = camera_data['depth']  # (N_frames, H, W)
                 self._da3_process_res = max(depth_data.shape[1], depth_data.shape[2])
-                for i in range(min(depth_data.shape[0], len(self.frame_data))):
-                    self.da3_depths[i] = torch.tensor(depth_data[i], dtype=torch.float32, device=self.device)
-                print(f"  Loaded DA3 depth maps: {len(self.da3_depths)} frames, shape={depth_data.shape[1:]}")
-            print(f"  Focal length (DA3 raw): {self.focal_length:.2f}")
+                npz_pos_by_stem = None
+                if 'image_files' in camera_data:
+                    npz_pos_by_stem = {
+                        os.path.splitext(os.path.basename(str(p)))[0]: i
+                        for i, p in enumerate(camera_data['image_files'])
+                    }
+                for pos, fd in enumerate(self.frame_data):
+                    stem = os.path.basename(fd["frame_dir"].rstrip('/'))
+                    di = npz_pos_by_stem.get(stem) if npz_pos_by_stem is not None else None
+                    if di is None and npz_pos_by_stem is None:
+                        di = pos  # legacy npz without image_files: positional
+                    if di is not None and di < depth_data.shape[0]:
+                        self.da3_depths[fd["frame_idx"]] = torch.tensor(
+                            depth_data[di], dtype=torch.float32, device=self.device)
+                if not self.da3_depths and depth_data.shape[0] == len(self.frame_data):
+                    for pos, fd in enumerate(self.frame_data):
+                        self.da3_depths[fd["frame_idx"]] = torch.tensor(
+                            depth_data[pos], dtype=torch.float32, device=self.device)
+                print(f"  Loaded DA3 depth maps: {len(self.da3_depths)}/{len(self.frame_data)} frames, shape={depth_data.shape[1:]}")
+            print(f"  Focal length (DA3): {self.focal_length:.2f}")
 
         # Load GT images
         self._load_gt_images()
@@ -487,15 +498,7 @@ class SAM3DDataLoader:
         # Import SceneVisualizer for proper transform application
         from sam3d_objects.utils.visualization import SceneVisualizer
 
-        # C4D objects: clamp scale >= 1.0 to unit scale (artifact workaround).
-        # DAVIS/other datasets: use the true SAM3D scale.
-        raw_scale = transform["scale"]
-        scale_val = raw_scale.flatten()[0].item()
-        clamp_scale = not self.config.get("is_davis", False)
-        if clamp_scale and scale_val >= 1.0:
-            scale_t = torch.ones_like(raw_scale)
-        else:
-            scale_t = raw_scale
+        scale_t = transform["scale"]
 
         PC = SceneVisualizer.object_pointcloud(
             points_local=xyz.unsqueeze(0),
@@ -2841,8 +2844,9 @@ if __name__ == "__main__":
                         help="Batch size for KNN precomputation to avoid OOM on large point clouds (default: 4096)")
     parser.add_argument("--lambda_rc", type=float, default=0,
                         help="Random-camera (novel view) anchoring loss weight — applies to both the depth and RGB terms (default: 0)")
-    parser.add_argument("--rc_orbit_distance", type=float, default=3.0,
-                        help="Random camera orbit distance from object centroid (default: auto per dataset)")
+    parser.add_argument("--rc_orbit_distance", type=float, default=None,
+                        help="Random camera orbit distance from object centroid. Default: "
+                             "per-object DAVIS table when applicable, else 3.0.")
     parser.add_argument("--rc_batch_size", type=int, default=2,
                         help="Number of random cameras to sample per iteration for RC loss (default: 1)")
     parser.add_argument("--disable_rendering_loss_iter", type=int, default=0,
@@ -2977,6 +2981,7 @@ if __name__ == "__main__":
                 object_name=obj_name,
                 input_dir=per_obj_input_dir,
                 max_frames=getattr(args, 'max_frames', 0),
+                da3_npz=args.da3_npz,
             )
 
             args.sam3d_data = sam3d_data
