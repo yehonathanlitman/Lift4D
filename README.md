@@ -171,8 +171,8 @@ By default stage 2 also runs [Depth Anything 3](https://github.com/ByteDance-See
 over the selected frames (`--run_da3`, disable with `--no-run_da3`).
 
 If pose alignment with the object in the video is bad in `comparison.mp4`, try using pose refinement with
-`--refine_pose`. It optimizes each frame's pose so its rendered silhouette
-matches that frame's input mask. Off by default.
+`--refine_pose`. It optimizes each frame's pose so its rendered mask
+matches that frame's input mask, which will improve the final appearance quality if the initial alignment is bad. Off by default.
 
 ### Stage 3 — Lift4D training
 
